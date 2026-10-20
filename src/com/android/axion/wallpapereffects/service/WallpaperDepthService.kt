@@ -44,6 +44,11 @@ private const val SETTING_DEPTH_MASK = "ax_depth_subject_mask"
 private const val SETTING_DEPTH_BOUNDS = "ax_depth_subject_bounds"
 private const val SETTING_DEPTH_ENABLED = "ax_depth_clock_enabled"
 private const val DE_PHOTO_FILE = "wallpaper.jpg"
+/** Per-preset outline tunables written by the Rime lock screen page; see DepthMaskUtils.Options. */
+private const val SETTING_DEPTH_OPTIONS = "ax_depth_options"
+
+/** Preview protocol for the Rime page (same uid): request what=1 with "photo", "options", "request". */
+const val MSG_PREVIEW_MASK = 1
 
 class WallpaperDepthService : Service() {
 
@@ -83,6 +88,11 @@ class WallpaperDepthService : Service() {
             false,
             enabledObserver,
         )
+        contentResolver.registerContentObserver(
+            Settings.Secure.getUriFor(SETTING_DEPTH_OPTIONS),
+            false,
+            enabledObserver,
+        )
 
         scheduleProcess()
     }
@@ -104,18 +114,102 @@ class WallpaperDepthService : Service() {
         return START_STICKY
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    private val previewThread by lazy { android.os.HandlerThread("DepthPreview").apply { start() } }
+    @Volatile private var latestPreview = 0
+    private var previewPhoto: String? = null
+    private var previewForeground: Bitmap? = null
+
+    /**
+     * The Rime page asks for a preset photo's subject outline while editing, before anything is
+     * applied. Only the latest request is answered; the segmentation of the last photo is kept so
+     * that changing an outline option only redoes the cheap extraction.
+     */
+    private val previewMessenger by lazy {
+        android.os.Messenger(object : Handler(previewThread.looper) {
+            override fun handleMessage(msg: android.os.Message) {
+                if (msg.what != MSG_PREVIEW_MASK) return
+                val request = msg.data.getInt("request")
+                val replyTo = msg.replyTo ?: return
+                latestPreview = request
+                // A newer request is already queued behind this one; let it answer.
+                if (hasMessages(MSG_PREVIEW_MASK)) return
+                // Throwable: an out-of-memory here must not take down this persistent process.
+                val mask = try {
+                    previewMask(msg.data.getString("photo"), msg.data.getString("options"))
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Preview mask failed", t)
+                    previewForeground?.recycle(); previewForeground = null; previewPhoto = null
+                    null
+                }
+                val reply = android.os.Message.obtain(null, MSG_PREVIEW_MASK).apply {
+                    data = android.os.Bundle().apply { putInt("request", request); putString("mask", mask) }
+                }
+                try { replyTo.send(reply) } catch (_: android.os.RemoteException) {}
+            }
+        })
+    }
+
+    private fun previewMask(photo: String?, options: String?): String? {
+        photo ?: return null
+        // Keyed by modification time too: a replaced photo keeps its file name.
+        val best = options?.contains("quality=best") == true
+        val key = "$photo@${File(photo).lastModified()}@$best"
+        if (key != previewPhoto) {
+            previewForeground?.recycle()
+            previewForeground = null
+            previewPhoto = null
+            // The outline is normalised and extracted 512 wide: a ~1024 px photo loses nothing.
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(photo, bounds)
+            var sample = 1
+            while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= 1024) sample *= 2
+            val bitmap = BitmapFactory.decodeFile(photo, BitmapFactory.Options().apply { inSampleSize = sample }) ?: return null
+            val segmenter = PortraitSegmenter(this)
+            try {
+                segmenter.init()
+                previewForeground = segmenter.segment(bitmap, best)
+            } finally {
+                segmenter.release()
+                bitmap.recycle()
+            }
+            previewPhoto = key
+        }
+        val foreground = previewForeground ?: return null
+        return DepthMaskUtils.extractSubjectPath(foreground, DepthMaskUtils.Options.parse(options))
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = previewMessenger.binder
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        // The page closed; the cached segmentation is not worth keeping in a persistent process.
+        Handler(previewThread.looper).post { previewForeground?.recycle(); previewForeground = null; previewPhoto = null }
+        return false
+    }
 
     override fun onDestroy() {
         Log.d(TAG, "onDestroy")
         WallpaperManager.getInstance(this).removeOnColorsChangedListener(colorsListener)
         contentResolver.unregisterContentObserver(enabledObserver)
         currentProcessToken = null
+        handler.removeCallbacks(startProcess)
         processingThread?.interrupt()
+        previewThread.quitSafely()
         super.onDestroy()
     }
 
+    private val startProcess = Runnable { processNow() }
+
+    /**
+     * Coalesced: one wallpaper apply fires the colours listener for home and lock and the settings
+     * observers, and each full segmentation needs a lot of memory. Interrupting does not stop a
+     * running model, so without this several of them would run at once.
+     */
     private fun scheduleProcess() {
+        handler.removeCallbacks(startProcess)
+        handler.postDelayed(startProcess, 500L)
+    }
+
+    private fun processNow() {
         val token = ProcessToken()
         currentProcessToken = token
         processingThread?.interrupt()
@@ -125,7 +219,8 @@ class WallpaperDepthService : Service() {
                     processWallpaper(token)
                 } catch (e: InterruptedException) {
                     Log.d(TAG, "Processing interrupted")
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
+                    // Throwable: an out-of-memory must not take down this persistent process.
                     Log.e(TAG, "Failed to process wallpaper depth", e)
                     if (isCurrentProcess(token)) {
                         clearAllMasks()
@@ -358,7 +453,10 @@ class WallpaperDepthService : Service() {
                 )
             }
         return try {
-            DepthMaskUtils.extractSubjectPath(cropped)
+            // Taps are stored over the whole photo; this extraction sees only the crop.
+            DepthMaskUtils.extractSubjectPath(cropped,
+                DepthMaskUtils.Options.parse(Settings.Secure.getString(contentResolver, SETTING_DEPTH_OPTIONS))
+                    .inCrop(cropRect, foreground.width, foreground.height))
         } finally {
             if (cropped !== foreground) cropped.recycle()
         }

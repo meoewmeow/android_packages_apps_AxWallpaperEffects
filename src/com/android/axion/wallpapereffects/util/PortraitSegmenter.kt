@@ -99,7 +99,12 @@ class PortraitSegmenter(private val context: Context) {
         return cachedModel
     }
 
-    fun segment(bitmap: Bitmap): Bitmap? {
+    /**
+     * [best] runs BiRefNet first (Rime's "Best" depth option); null reads it from the applied
+     * depth options. Any failure there falls back to the fast pipeline below.
+     */
+    fun segment(bitmap: Bitmap, best: Boolean? = null): Bitmap? {
+        if (best ?: wantsBest(context)) BestCutter.cut(context, bitmap)?.let { return it }
         val raidFile = raidModelFile ?: return null
 
         if (!hasFullPipeline) {
@@ -782,5 +787,96 @@ class PortraitSegmenter(private val context: Context) {
     companion object {
         private const val COMPACT_MASK_WIDTH = 64
         private const val MIN_SUBJECT_RATIO = 0.02f
+    }
+}
+
+/** Whether the applied depth options ask for the Best model. */
+internal fun wantsBest(context: Context): Boolean =
+    android.provider.Settings.Secure.getString(context.contentResolver, "ax_depth_options")?.contains("quality=best") == true
+
+/**
+ * BiRefNet-lite (MIT, github.com/ZhengPeng7/BiRefNet), converted to TFLite with the sigmoid
+ * baked in: input [1,1024,1024,3] RGB normalised with ImageNet mean/std, output a [0,1] mask.
+ * Returns the photo with the mask as its alpha, like the fast pipeline's foreground.
+ */
+internal object BestCutter {
+    private const val TAG = "BestCutter"
+    private const val MODEL = "birefnet_lite_1024_fp16.tflite"
+    private val MEAN = floatArrayOf(0.485f, 0.456f, 0.406f)
+    private val STD = floatArrayOf(0.229f, 0.224f, 0.225f)
+
+    @Synchronized
+    fun cut(context: Context, bitmap: Bitmap): Bitmap? {
+        // A native crash cannot be caught. Each start is counted and a finished run clears the
+        // count; two unfinished runs in a row on this install (a crash, not just one reboot or
+        // kill) switch it to the fast model for good instead of crashing again.
+        val prefs = context.createDeviceProtectedStorageContext().getSharedPreferences("best_cutter", Context.MODE_PRIVATE)
+        val install = runCatching { context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime }.getOrDefault(0L)
+        val unfinished = if (prefs.getLong("install", -1L) == install) prefs.getInt("unfinished", 0) else 0
+        if (unfinished >= 2) {
+            Log.w(TAG, "Earlier runs did not finish; using the fast model")
+            return null
+        }
+        prefs.edit().putLong("install", install).putInt("unfinished", unfinished + 1).commit()
+        val started = System.currentTimeMillis()
+        try {
+            val model = context.assets.openFd(MODEL).use { fd ->
+                java.io.FileInputStream(fd.fileDescriptor).channel.use { channel ->
+                    channel.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
+                }
+            }
+            Interpreter(model, Interpreter.Options().apply { setNumThreads(4); setUseXNNPACK(true) }).use { interpreter ->
+                val inShape = interpreter.getInputTensor(0).shape()
+                val nchw = inShape.size == 4 && inShape[1] == 3
+                val h = if (nchw) inShape[2] else inShape[1]
+                val w = if (nchw) inShape[3] else inShape[2]
+                val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
+                val pixels = IntArray(w * h)
+                scaled.getPixels(pixels, 0, w, 0, 0, w, h)
+                if (scaled !== bitmap) scaled.recycle()
+                val input = ByteBuffer.allocateDirect(4 * w * h * 3).order(ByteOrder.nativeOrder())
+                val floats = input.asFloatBuffer()
+                if (nchw) {
+                    for (c in 0 until 3) for (i in pixels.indices) {
+                        val v = (pixels[i] shr (16 - 8 * c)) and 0xFF
+                        floats.put((v / 255f - MEAN[c]) / STD[c])
+                    }
+                } else {
+                    for (p in pixels) for (c in 0 until 3) {
+                        val v = (p shr (16 - 8 * c)) and 0xFF
+                        floats.put((v / 255f - MEAN[c]) / STD[c])
+                    }
+                }
+                val outShape = interpreter.getOutputTensor(0).shape()
+                val outCount = outShape.fold(1) { a, b -> a * b }
+                if (outCount != w * h) { Log.w(TAG, "Unexpected output ${outShape.contentToString()}"); return null }
+                val output = ByteBuffer.allocateDirect(4 * outCount).order(ByteOrder.nativeOrder())
+                interpreter.run(input, output)
+                output.rewind()
+                val mask = output.asFloatBuffer()
+                // A single-channel mask has the same order either way.
+                val alpha = IntArray(w * h) { i -> val a = (mask.get(i).coerceIn(0f, 1f) * 255f + 0.5f).toInt(); a shl 24 }
+                val small = Bitmap.createBitmap(alpha, w, h, ARGB_8888)
+                val full = Bitmap.createScaledBitmap(small, bitmap.width, bitmap.height, true)
+                if (full !== small) small.recycle()
+                // The photo, with the mask as its alpha.
+                val result = bitmap.copy(ARGB_8888, true)
+                val photo = IntArray(bitmap.width * bitmap.height)
+                result.getPixels(photo, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+                val a = IntArray(photo.size)
+                full.getPixels(a, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+                full.recycle()
+                for (i in photo.indices) photo[i] = (a[i] and 0xFF000000.toInt()) or (photo[i] and 0x00FFFFFF)
+                result.setPixels(photo, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+                Log.d(TAG, "Cut ${bitmap.width}x${bitmap.height} in ${System.currentTimeMillis() - started} ms")
+                return result
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Best model failed; using the fast model", t)
+            return null
+        } finally {
+            // Reached unless the process died: the run finished, whatever its result.
+            prefs.edit().putInt("unfinished", 0).commit()
+        }
     }
 }

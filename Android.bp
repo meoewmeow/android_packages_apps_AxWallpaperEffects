@@ -28,6 +28,9 @@ android_app {
         "libtensorflowlite_jni",
         "libtensorflowlite_gpu_jni",
     ],
+    // Carried inside the APK: an adb-installed update (persistent app, staged) otherwise has no
+    // native libraries, because the system copy's libs are only symlinks under /system_ext.
+    use_embedded_native_libs: true,
     aaptflags: [
         "-0 .tflite",
     ],

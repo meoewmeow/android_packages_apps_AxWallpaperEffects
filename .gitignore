@@ -1,0 +1,3 @@
+# Generated from public source models by the conversion scripts; not stored in git.
+/assets/birefnet_lite_1024_fp16.tflite
+/assets/migan_inpaint_512_fp16.tflite

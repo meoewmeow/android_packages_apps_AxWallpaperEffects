@@ -28,6 +28,7 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.view.SurfaceHolder
 import com.android.axion.wallpapereffects.renderer.CinematicRenderer
@@ -40,6 +41,10 @@ private const val ACTION_RELOAD = "com.android.axion.wallpapereffects.RELOAD_WAL
 private const val GYRO_SENSITIVITY = 2.4f
 private const val GYRO_MAX_OFFSET = 0.45f
 private const val GYRO_DECAY = 0.92f
+// Keys of Rime's tilt, sent by SystemUI with the lock screen layout command.
+private const val EXTRA_SPATIAL_X = "rime_spatial_x"
+private const val EXTRA_SPATIAL_Y = "rime_spatial_y"
+private const val EXTERNAL_HOLD_MS = 1500L
 
 class CinematicService : LiveWallpaper() {
 
@@ -63,6 +68,13 @@ class CinematicEngine(context: Context, surfaceHolder: SurfaceHolder) :
 
     private var scrollOffset = 0f
     private var isResumed = false
+    /**
+     * Rime's lock screen drives the tilt itself and sends it here, so the clock's depth cut-out
+     * moves with the subject exactly. While it does, this engine's own gyro is ignored.
+     */
+    private var externalX = 0f
+    private var externalY = 0f
+    private var externalUntil = 0L
 
     private val receiver =
         object : BroadcastReceiver() {
@@ -75,7 +87,7 @@ class CinematicEngine(context: Context, surfaceHolder: SurfaceHolder) :
         }
 
     override fun create(isFirstActiveInstance: Boolean) {
-        myRenderer = CinematicRenderer(context)
+        myRenderer = CinematicRenderer(context).also { it.onLayersReady = { requestRender() } }
         initGL(myRenderer!!)
 
         val filter = IntentFilter(ACTION_RELOAD)
@@ -157,8 +169,18 @@ class CinematicEngine(context: Context, surfaceHolder: SurfaceHolder) :
         lastTimestamp = 0L
     }
 
+    override fun onLockscreenLayoutChanged(extras: Bundle) {
+        if (!extras.containsKey(EXTRA_SPATIAL_X)) return
+        externalX = extras.getFloat(EXTRA_SPATIAL_X)
+        externalY = extras.getFloat(EXTRA_SPATIAL_Y)
+        externalUntil = SystemClock.uptimeMillis() + EXTERNAL_HOLD_MS
+        updateRendererOffset()
+        requestRender()
+    }
+
     override fun onSensorChanged(event: SensorEvent) {
         if (event.sensor.type != Sensor.TYPE_GYROSCOPE) return
+        if (SystemClock.uptimeMillis() < externalUntil) { lastTimestamp = 0L; return }
 
         val now = event.timestamp
         if (lastTimestamp != 0L) {
@@ -183,6 +205,11 @@ class CinematicEngine(context: Context, surfaceHolder: SurfaceHolder) :
 
     private fun updateRendererOffset() {
         val r = myRenderer ?: return
+        if (SystemClock.uptimeMillis() < externalUntil) {
+            r.offsetX = externalX
+            r.offsetY = externalY
+            return
+        }
         r.offsetX = gyroX + scrollOffset * 0.25f
         r.offsetY = gyroY
     }

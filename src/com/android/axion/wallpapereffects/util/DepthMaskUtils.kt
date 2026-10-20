@@ -79,7 +79,49 @@ object DepthMaskUtils {
         return encoded
     }
 
-    fun extractSubjectPath(foreground: Bitmap): String? {
+    /**
+     * Tunables for the subject outline, chosen per lock screen preset. Encoded as
+     * "subject=all;edge=loose;detail=fine" in Settings.Secure ax_depth_options; unknown or
+     * missing keys keep Axion's original behaviour.
+     */
+    data class Options(
+        val allSubjects: Boolean = false,
+        /** Pixels at the 512-wide extraction size: negative shrinks the outline, positive grows it. */
+        val growPx: Int = 0,
+        val threshold: Int = MASK_ALPHA_THRESHOLD,
+        val epsilon: Float = PATH_SIMPLIFY_EPSILON,
+        val smoothing: Int = SMOOTHING_PASSES,
+        /** Tapped points, 0..1 over the bitmap given to extractSubjectPath; keep only parts there. */
+        val picks: List<FloatArray> = emptyList(),
+    ) {
+        /** [picks] given over a whole photo, re-expressed over its [crop] (pixels of a [w]x[h] photo). */
+        fun inCrop(crop: android.graphics.Rect, w: Int, h: Int): Options = copy(picks = picks.mapNotNull { p ->
+            val x = (p[0] * w - crop.left) / crop.width().coerceAtLeast(1)
+            val y = (p[1] * h - crop.top) / crop.height().coerceAtLeast(1)
+            if (x in 0f..1f && y in 0f..1f) floatArrayOf(x, y) else null
+        })
+
+        companion object {
+            fun parse(encoded: String?): Options {
+                val values = encoded.orEmpty().split(';').mapNotNull { part ->
+                    part.split('=', limit = 2).takeIf { it.size == 2 }?.let { it[0].trim() to it[1].trim() }
+                }.toMap()
+                return Options(
+                    allSubjects = values["subject"] == "all",
+                    growPx = when (values["edge"]) { "tight" -> -2; "loose" -> 3; else -> 0 },
+                    threshold = when (values["edge"]) { "tight" -> 170; "loose" -> 90; else -> MASK_ALPHA_THRESHOLD },
+                    epsilon = when (values["detail"]) { "fine" -> 0.5f; "smooth" -> 2.0f; else -> PATH_SIMPLIFY_EPSILON },
+                    smoothing = when (values["detail"]) { "fine" -> 1; "smooth" -> 3; else -> SMOOTHING_PASSES },
+                    picks = values["pick"].orEmpty().split(',').mapNotNull { pair ->
+                        val xy = pair.split(':').mapNotNull { it.toFloatOrNull() }
+                        if (xy.size == 2) floatArrayOf(xy[0], xy[1]) else null
+                    },
+                )
+            }
+        }
+    }
+
+    fun extractSubjectPath(foreground: Bitmap, options: Options = Options()): String? {
         if (foreground.width <= 0 || foreground.height <= 0) return null
 
         val aspectRatio = foreground.height.toFloat() / foreground.width
@@ -94,7 +136,7 @@ object DepthMaskUtils {
         val mask = BooleanArray(extractW * extractH)
         var nonZeroCount = 0
         for (i in pixels.indices) {
-            if (Color.alpha(pixels[i]) > MASK_ALPHA_THRESHOLD) {
+            if (Color.alpha(pixels[i]) > options.threshold) {
                 mask[i] = true
                 nonZeroCount++
             }
@@ -104,13 +146,19 @@ object DepthMaskUtils {
             return null
         }
 
-        val subjectCount = keepLargestComponent(mask, extractW, extractH)
+        val subjectCount = when {
+            options.picks.isNotEmpty() -> keepPickedComponents(mask, extractW, extractH, options.picks)
+                .takeIf { it > 0 } ?: keepLargestComponent(mask, extractW, extractH)
+            options.allSubjects -> nonZeroCount
+            else -> keepLargestComponent(mask, extractW, extractH)
+        }
         if (subjectCount.toFloat() / pixels.size < MIN_SUBJECT_RATIO) {
             Log.d(TAG, "No significant connected subject ($subjectCount/${pixels.size} fg pixels)")
             return null
         }
 
         fillInternalHoles(mask, extractW, extractH)
+        if (options.growPx != 0) morph(mask, extractW, extractH, options.growPx)
 
         val region = Region()
         for (y in 0 until extractH) {
@@ -142,7 +190,7 @@ object DepthMaskUtils {
             return null
         }
 
-        val epsilon = PATH_SIMPLIFY_EPSILON / extractW * NORMALIZE_RANGE
+        val epsilon = options.epsilon / extractW * NORMALIZE_RANGE
         val simplified =
             contours
                 .map { contour ->
@@ -154,7 +202,7 @@ object DepthMaskUtils {
                             )
                         }
                     val reduced = douglasPeucker(normalized, epsilon)
-                    smoothContour(reduced, SMOOTHING_PASSES)
+                    smoothContour(reduced, options.smoothing)
                 }
                 .filter { it.size >= 3 }
 
@@ -187,6 +235,21 @@ object DepthMaskUtils {
                 "$totalPoints points, ${encoded.length} chars",
         )
         return encoded
+    }
+
+    /** Grows (positive) or shrinks (negative) the mask by [steps] pixels, one 4-neighbour pass per step. */
+    private fun morph(mask: BooleanArray, w: Int, h: Int, steps: Int) {
+        val grow = steps > 0
+        repeat(kotlin.math.abs(steps)) {
+            val source = mask.copyOf()
+            for (y in 0 until h) for (x in 0 until w) {
+                val i = y * w + x
+                if (source[i] == grow) continue
+                val touches = (x > 0 && source[i - 1] == grow) || (x < w - 1 && source[i + 1] == grow) ||
+                    (y > 0 && source[i - w] == grow) || (y < h - 1 && source[i + w] == grow)
+                if (touches) mask[i] = grow
+            }
+        }
     }
 
     private fun extractContours(path: Path): List<List<FloatArray>> {
@@ -349,6 +412,58 @@ object DepthMaskUtils {
                 mask[i] = true
             }
         }
+    }
+
+    /**
+     * Keeps the connected parts under the tapped points; a tap just beside a part (within 4% of
+     * the width) still takes it. Returns the kept pixel count, 0 when no tap hit anything (the
+     * mask is then left untouched).
+     */
+    private fun keepPickedComponents(mask: BooleanArray, w: Int, h: Int, picks: List<FloatArray>): Int {
+        val labels = IntArray(mask.size)
+        val queue = IntArray(mask.size)
+        var label = 0
+        for (start in mask.indices) {
+            if (!mask[start] || labels[start] != 0) continue
+            label++
+            var head = 0
+            var tail = 0
+            labels[start] = label
+            queue[tail++] = start
+            while (head < tail) {
+                val idx = queue[head++]
+                val x = idx % w
+                val y = idx / w
+                for (next in intArrayOf(if (x > 0) idx - 1 else -1, if (x < w - 1) idx + 1 else -1,
+                        if (y > 0) idx - w else -1, if (y < h - 1) idx + w else -1)) {
+                    if (next >= 0 && mask[next] && labels[next] == 0) { labels[next] = label; queue[tail++] = next }
+                }
+            }
+        }
+        val radius = (w * 0.04f).toInt().coerceAtLeast(2)
+        val kept = HashSet<Int>()
+        for (pick in picks) {
+            val px = (pick[0] * w).toInt().coerceIn(0, w - 1)
+            val py = (pick[1] * h).toInt().coerceIn(0, h - 1)
+            var best = -1
+            var bestDistance = Int.MAX_VALUE
+            for (dy in -radius..radius) for (dx in -radius..radius) {
+                val x = px + dx
+                val y = py + dy
+                if (x !in 0 until w || y !in 0 until h) continue
+                val l = labels[y * w + x]
+                val d = dx * dx + dy * dy
+                if (l != 0 && d < bestDistance) { best = l; bestDistance = d }
+            }
+            if (best > 0) kept += best
+        }
+        if (kept.isEmpty()) return 0
+        var count = 0
+        for (i in mask.indices) {
+            mask[i] = labels[i] in kept
+            if (mask[i]) count++
+        }
+        return count
     }
 
     private fun keepLargestComponent(mask: BooleanArray, w: Int, h: Int): Int {

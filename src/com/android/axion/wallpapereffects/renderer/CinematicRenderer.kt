@@ -37,16 +37,24 @@ import javax.microedition.khronos.opengles.GL10
 private const val TAG = "CinematicRenderer"
 private const val DEFAULT_PARALLAX_STRENGTH = 0.085f
 private const val DEFAULT_VIGNETTE_STRENGTH = 0.5f
+/** 1 while the Spatial subject is drawn as its own moving layer; read by Rime's lock screen. */
+private const val SPATIAL_LAYERS_KEY = "rime_spatial_layers"
 
 class CinematicRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
     var offsetX: Float = 0f
     var offsetY: Float = 0f
+    private var spatial = false
+    private var spatialStrength = 1f
     @Volatile var needsReload: Boolean = false
+    /** Asks the engine for a frame once spatial layers built in the background are ready. */
+    var onLayersReady: (() -> Unit)? = null
 
     private var programId = 0
     private var colorTextureId = 0
     private var depthTextureId = 0
+    private var bgTextureId = 0
+    private var alphaTextureId = 0
     private var surfaceWidth = 0
     private var surfaceHeight = 0
 
@@ -83,11 +91,38 @@ class CinematicRenderer(private val context: Context) : GLSurfaceView.Renderer {
             colorTextureId = 0
             depthTextureId = 0
         }
+        deleteSpatialTextures()
 
+        // Read once per texture load: the Rime page sends RELOAD_WALLPAPER after changing them.
+        spatial = android.provider.Settings.Secure.getInt(context.contentResolver, "ax_spatial_mode", 0) == 1
+        spatialStrength = android.provider.Settings.Secure.getFloat(context.contentResolver, "ax_spatial_strength", 0.25f)
+            .coerceIn(0.25f, 2f).takeIf { spatial } ?: 1f
         val wallpaper = loadFixedWallpaper()
         Log.d(TAG, "Loaded wallpaper: ${wallpaper.width}x${wallpaper.height}")
 
         colorTextureId = uploadTexture(wallpaper)
+        if (spatial) {
+            val photo = File(context.createDeviceProtectedStorageContext().filesDir, "wallpaper.jpg")
+            val layers = try { SpatialLayers.cached(context, photo) } catch (t: Throwable) { null }
+            // Segmentation and inpainting take seconds and must not run on this GL thread: build
+            // them aside, then reload. Until then, or if it fails, the anchored warp stands in.
+            if (layers == null && SpatialLayers.shouldBuild(context, photo)) {
+                Thread {
+                    if (SpatialLayers.build(context, photo)) {
+                        needsReload = true
+                        onLayersReady?.invoke()
+                    }
+                }.start()
+            }
+            if (layers != null) {
+                bgTextureId = uploadTexture(layers.background)
+                alphaTextureId = uploadTexture(layers.subjectAlpha)
+                layers.background.recycle()
+                layers.subjectAlpha.recycle()
+            }
+        }
+        // SystemUI moves the clock's cut-out with the subject only while the subject really moves.
+        publishLayered(spatial && bgTextureId != 0 && alphaTextureId != 0)
 
         val rawDepth = depthEstimator.estimateDepth(wallpaper)
         if (rawDepth != null) {
@@ -272,10 +307,25 @@ class CinematicRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES30.glUseProgram(programId)
 
         GLES30.glUniform2f(GLES30.glGetUniformLocation(programId, "uOffset"), offsetX, offsetY)
+        val layered = spatial && bgTextureId != 0 && alphaTextureId != 0
+        // Spatial without its layers (still being built, or no subject) shows the photo still and
+        // unzoomed, so it matches the clock's depth cut-out; a warp there smeared the subject.
+        val still = spatial && !layered
         GLES30.glUniform1f(
             GLES30.glGetUniformLocation(programId, "uParallaxStrength"),
-            DEFAULT_PARALLAX_STRENGTH,
+            if (still) 0f else DEFAULT_PARALLAX_STRENGTH * spatialStrength,
         )
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uZoom"), if (still) 1f else 1.12f)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uAnchor"), if (still) 1f else 0f)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uSpatial"), if (layered) 1f else 0f)
+        if (layered) {
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, bgTextureId)
+            GLES30.glUniform1i(GLES30.glGetUniformLocation(programId, "uTextureBg"), 2)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE3)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, alphaTextureId)
+            GLES30.glUniform1i(GLES30.glGetUniformLocation(programId, "uTextureAlpha"), 3)
+        }
         GLES30.glUniform1f(
             GLES30.glGetUniformLocation(programId, "uVignetteStrength"),
             DEFAULT_VIGNETTE_STRENGTH,
@@ -306,7 +356,23 @@ class CinematicRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES30.glDisableVertexAttribArray(aTexLoc)
     }
 
+    private fun publishLayered(layered: Boolean) {
+        try {
+            android.provider.Settings.Secure.putInt(context.contentResolver, SPATIAL_LAYERS_KEY, if (layered) 1 else 0)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not publish spatial layer state", t)
+        }
+    }
+
+    private fun deleteSpatialTextures() {
+        if (bgTextureId != 0) GLES30.glDeleteTextures(1, intArrayOf(bgTextureId), 0)
+        if (alphaTextureId != 0) GLES30.glDeleteTextures(1, intArrayOf(alphaTextureId), 0)
+        bgTextureId = 0
+        alphaTextureId = 0
+    }
+
     fun cleanup() {
+        deleteSpatialTextures()
         if (colorTextureId != 0) GLES30.glDeleteTextures(1, intArrayOf(colorTextureId), 0)
         if (depthTextureId != 0) GLES30.glDeleteTextures(1, intArrayOf(depthTextureId), 0)
         colorTextureId = 0
