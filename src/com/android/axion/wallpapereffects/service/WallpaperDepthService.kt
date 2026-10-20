@@ -111,6 +111,7 @@ class WallpaperDepthService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "onStartCommand")
+        scheduleProcess()
         return START_STICKY
     }
 
@@ -423,13 +424,14 @@ class WallpaperDepthService : Service() {
                 return@map matchedCrop
             }
             val clamped = clampCrop(storedHint, wallpaper.bitmap)
-            val visibleW = matchedCrop.width().coerceAtMost(clamped.width())
             val visibleH = matchedCrop.height().coerceAtMost(clamped.height())
+            val cropTop = clamped.top.coerceAtMost(wallpaper.bitmap.height - visibleH)
+            val cropBottom = (cropTop + visibleH).coerceAtMost(wallpaper.bitmap.height)
             Rect(
-                clamped.left.coerceAtMost(wallpaper.bitmap.width - visibleW),
-                clamped.top.coerceAtMost(wallpaper.bitmap.height - visibleH),
-                (clamped.left + visibleW).coerceAtMost(wallpaper.bitmap.width),
-                (clamped.top + visibleH).coerceAtMost(wallpaper.bitmap.height),
+                clamped.left,
+                cropTop,
+                clamped.right,
+                cropBottom,
             ).also { r -> if (r.width() < 1 || r.height() < 1) return@map matchedCrop }
         }
     }
