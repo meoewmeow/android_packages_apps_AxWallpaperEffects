@@ -68,6 +68,8 @@ class CinematicEngine(context: Context, surfaceHolder: SurfaceHolder) :
 
     private var scrollOffset = 0f
     private var isResumed = false
+    /** False between going-to-sleep and waking: AOD can make the wallpaper visible, and resume() must not restart the gyro then. */
+    private var isAwake = true
     /**
      * Rime's lock screen drives the tilt itself and sends it here, so the clock's depth cut-out
      * moves with the subject exactly. While it does, this engine's own gyro is ignored.
@@ -103,7 +105,7 @@ class CinematicEngine(context: Context, surfaceHolder: SurfaceHolder) :
     override fun resume() {
         super.resume()
         isResumed = true
-        gyroSensor?.let {
+        if (isAwake) gyroSensor?.let {
             sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
         updateRendererOffset()
@@ -155,6 +157,7 @@ class CinematicEngine(context: Context, surfaceHolder: SurfaceHolder) :
     }
 
     override fun onWake(extras: Bundle) {
+        isAwake = true
         if (isResumed) {
             gyroSensor?.let {
                 sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
@@ -163,10 +166,13 @@ class CinematicEngine(context: Context, surfaceHolder: SurfaceHolder) :
     }
 
     override fun onSleep(extras: Bundle) {
+        isAwake = false
         sensorManager?.unregisterListener(this)
         gyroX = 0f
         gyroY = 0f
         lastTimestamp = 0L
+        updateRendererOffset()
+        requestRender()
     }
 
     override fun onLockscreenLayoutChanged(extras: Bundle) {
